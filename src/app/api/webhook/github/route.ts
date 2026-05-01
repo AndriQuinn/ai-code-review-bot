@@ -7,6 +7,7 @@ export async function POST(req: Request) {
     const event = req.headers?.get('x-github-event')
 
     const error = checkRequest(event, signature, rawBody)
+    console.log(error)
     if (error) return error
 
     const payload = await req.json();
