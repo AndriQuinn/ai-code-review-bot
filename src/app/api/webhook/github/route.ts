@@ -1,5 +1,4 @@
 import { createHmac } from 'crypto'
-import { stat } from 'fs/promises'
 
 export async function POST(req: Request) {
 
@@ -7,25 +6,32 @@ export async function POST(req: Request) {
     const signature = req.headers.get('x-hub-signature-256')
     const event = req.headers?.get('x-github-event')
 
+    // Validate Request
     const error = checkRequest(event, signature, rawBody)
     if (error) return error
 
+    // Validate Actions
     const payload = JSON.parse(rawBody);
     const action = payload.action;
+    const isDraft = payload.pull_request.draft
+    const REVIEWABLE_ACTIONS = ['opened', 'synchronize', 'reopened', 'ready_for_review']
 
-    if (action != 'opened') return new Response('Event Ignored', { status: 200 })
-    
+    if (isDraft) return new Response('Event Ignored', { status: 200 })
+    if (!REVIEWABLE_ACTIONS.includes(action)) return new Response('Event Ignored', { status: 200 })
+
+    // Check Diff 
     const getDiff = await checkDiff(payload.pull_request.diff_url)
-    if (!getDiff.ok) new Response(getDiff.message, { status: 500 })    
+    if (!getDiff.ok) return new Response(getDiff.message, { status: 500 })    
 
+    // Review Diff 
     const diffText = getDiff.content
     const reviewResult = await aiReview(diffText)
 
     if (!reviewResult.ok) return new Response('Something wrong happened', { status: 500 })
     
-    const checkPostReview = await postReview(reviewResult.content, payload)
+    postReview(reviewResult.content, payload)
 
-    return new Response(JSON.stringify(checkPostReview), { status: checkPostReview.status  })
+    return new Response(JSON.stringify({message: 'OK', pending: "Currently trying to post the review"}), { status: 200  })
 }
 
 // --- Functions ---
@@ -57,7 +63,7 @@ async function aiReview(diff: string | null) {
 
         const reviewContent = await fetchGeminiApi(model, diff)
 
-        if (reviewContent.status == 401 ) return { status: reviewContent.status, content: null };
+        if (reviewContent.status == 401 ) return { ok: false, status: reviewContent.status, content: null };
         if (!reviewContent.ok)  continue
 
         const reviewText = reviewContent.content
@@ -65,7 +71,7 @@ async function aiReview(diff: string | null) {
         return { ok: reviewContent.ok, status: reviewContent.status, content: reviewText }
     }
 
-    return { status: 404, content: 'All Gemini models are currently unavailable, Please try again later' }
+    return { ok: false, status: 500, content: 'All Gemini models are currently unavailable, Please try again later' }
 }
 
 // --- Fetch Gemini API ---
@@ -96,7 +102,7 @@ async function fetchGeminiApi(model: string, diff: string | null) {
         
     )
 
-    if (!response.ok) return { status: response.status, content: null }
+    if (!response.ok) return { ok: response.ok, status: response.status, content: null }
 
     const data = await response.json()
     const review = data.candidates[0].content.parts[0].text 
@@ -130,7 +136,7 @@ async function checkDiff(diffUrl: string) {
     if (!diffResult.ok) return {  message: 'Failed to fetch diff', ok: diffResult.ok, status: 500, content: null }
     if (!diffResult.content) return {  message: 'Empty diff', ok: false, status: 500, content: null }
     
-    return { ok: diffResult.ok, status: diffResult.status, content: diffResult.content }
+    return { message: 'Success', ok: diffResult.ok, status: diffResult.status, content: diffResult.content }
 }
 
 async function postReview(review: string, payload: any) {
@@ -154,8 +160,11 @@ async function postReview(review: string, payload: any) {
         })
     })
 
-    if (!response.ok) return { message: 'Failed to post review', ok: false, status: response.status, data: response.json }
-
     const data = await response.json()
+
+    console.log('GitHub API response status:', response.status)
+
+    if (!response.ok) return { message: 'Failed to post review', ok: false, status: response.status, data: data }
+    
     return { ok: true, status: response.status, data }
 }
