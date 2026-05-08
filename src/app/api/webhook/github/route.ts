@@ -10,6 +10,7 @@ export async function POST(req: Request) {
     // Validate Request
     const error = checkRequest(event, signature, rawBody)
     if (error) return error
+    console.log("Validate Request - SUCCESS")
 
     // Validate Actions
     const payload = JSON.parse(rawBody);
@@ -19,10 +20,12 @@ export async function POST(req: Request) {
 
     if (isDraft) return new Response('Event Ignored', { status: 200 })
     if (!REVIEWABLE_ACTIONS.includes(action)) return new Response('Event Ignored', { status: 200 })
+    console.log("Validate Action - SUCCESS")
 
     // Check Diff 
     const getDiff = await checkDiff(payload.pull_request.diff_url)
     if (!getDiff.ok) return new Response(getDiff.message, { status: 500 })    
+    console.log("DIFF Request - SUCCESS")
 
     // Review Diff 
     const diffText = getDiff.content
@@ -30,6 +33,7 @@ export async function POST(req: Request) {
 
     if (!reviewResult.ok) return new Response('Something wrong happened', { status: 500 })
     
+    console.log("Review DIFF Request - SUCCESS")
     postReview(reviewResult.content, payload)
 
     return new Response(JSON.stringify({message: 'OK', pending: "Currently trying to post the review"}), { status: 200  })
@@ -176,13 +180,15 @@ function createJWT() {
 
     const now = Math.floor(Date.now() / 1000)
 
+    const privateKey = process.env.GITHUB_PRIVATE_KEY!.replace(/\\n/g, '\n')
+
     return jwt.sign(
         {
             iss: process.env.GITHUB_APP_ID,  // App ID
             iat: now,                        // issued now
             exp: now + 600                   // expires in 10 minutes
         },
-        process.env.GITHUB_PRIVATE_KEY!,
+        privateKey,
         { algorithm: 'RS256' }
     )
 }
