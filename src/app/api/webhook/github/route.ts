@@ -1,5 +1,6 @@
 import { createHmac } from 'crypto'
 import jwt from 'jsonwebtoken'
+import { successResponse, errorResponse } from '@/utils/response'
 
 export async function POST(req: Request) {
 
@@ -20,7 +21,7 @@ export async function POST(req: Request) {
 
     if (isDraft) return new Response('Event Ignored', { status: 200 })
     if (!REVIEWABLE_ACTIONS.includes(action)) return new Response('Event Ignored', { status: 200 })
-    console.log("Validate Action - SUCCESS")
+    console.log(`Action ${action} - SUCCESS`)
 
     // Check Diff 
     const getDiff = await checkDiff(payload.pull_request.diff_url)
@@ -31,17 +32,17 @@ export async function POST(req: Request) {
     const diffText = getDiff.content
     const reviewResult = await aiReview(diffText)
 
-    if (!reviewResult.ok) return new Response('Something wrong happened', { status: 500 })
+    if (!reviewResult.ok) return new Response(reviewResult.message, { status: 500 })
     
     console.log("Review DIFF Request - SUCCESS")
-    postReview(reviewResult.content, payload)
+    postReview(reviewResult.content, payload, payload.installation.id)
 
     return new Response(JSON.stringify({message: 'OK', pending: "Currently trying to post the review"}), { status: 200  })
 }
 
 // --- Functions ---
 
-// --- Check Validity ---
+// --- Check Request Validity ---
 function checkRequest(event: string | null, signature: string | null, rawBody: string) {
 
     const secret = process.env.GITHUB_WEBHOOK_SECRET!
@@ -54,9 +55,45 @@ function checkRequest(event: string | null, signature: string | null, rawBody: s
     if (event != 'pull_request') return new Response('Event Ignored', { status: 200 });   
 }
 
+async function checkDiff(diffUrl: string) {
+
+    const diffResult = await fetchDiff(diffUrl)
+
+    if (!diffResult.ok) return errorResponse(diffResult.message, diffResult.status)
+    if (!diffResult.content) return errorResponse('Empty Diff',  500)
+
+    return successResponse(diffResult.content, diffResult.status)
+}
+
+// --- Fetch Diff URL ---
+async function fetchDiff(diff: string) {
+
+    try {
+        const response = await fetch(diff, {
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`,
+                'Accept': 'application/vnd.github.v3.diff'
+            }
+        })
+
+        if (response.status == 401) return errorResponse('Unauthorized', response.status)
+        if (!response.ok) return errorResponse('Failed to fetch the diff', response.status)
+
+        const data = await response.text()
+
+        return successResponse(data, response.status)
+
+    } catch (error) {
+        console.log('Network error:', error)
+        return errorResponse('Network error', 0)
+    }
+}
+
 // --- Get AI Review ---
 async function aiReview(diff: string | null) {
 
+    // Fallback chain for models
     const MODELS = [
         "gemini-3.1-flash-lite-preview", 
         "gemini-2.5-flash-lite",      
@@ -68,85 +105,63 @@ async function aiReview(diff: string | null) {
 
         const reviewContent = await fetchGeminiApi(model, diff)
 
-        if (reviewContent.status == 401 ) return { ok: false, status: reviewContent.status, content: null };
+        if (reviewContent.status == 401 ) return errorResponse('Unauthorized', reviewContent.status);
         if (!reviewContent.ok)  continue
 
         const reviewText = reviewContent.content
 
-        return { ok: reviewContent.ok, status: reviewContent.status, content: reviewText }
+        return successResponse(reviewText, reviewContent.status)
     }
 
-    return { ok: false, status: 500, content: 'All Gemini models are currently unavailable, Please try again later' }
+    return errorResponse('All Gemini models are currently unavailable, Please try again later', 500)
 }
 
 // --- Fetch Gemini API ---
 async function fetchGeminiApi(model: string, diff: string | null) {
 
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`,
-        {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                contents: [{
-                    parts: [{
-                        text: `
-                        You are a code reviewer. 
-                        Review this pull request diff and give concise, 
-                        actionable feedback. Focus on bugs, security issues, 
-                        and code clarity. Diff: 
-                        
-                        ${diff}
+    try {
 
-                        Rules:
-                        - be direct, natural, easy to understand
-                    `
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`,
+            {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    contents: [{
+                        parts: [{
+                            text: `
+                            You are a code reviewer. 
+                            Review this pull request diff and give concise, 
+                            actionable feedback. Focus on bugs, security issues, 
+                            and code clarity. Diff: 
+                            
+                            ${diff}
+
+                            Rules:
+                            - be direct, natural, easy to understand
+                        `
+                        }]
                     }]
-                }]
-            })
-        }
-        
-    )
+                })
+            }
+        )
 
-    if (!response.ok) return { ok: response.ok, status: response.status, content: null }
+        if (!response.ok) return errorResponse('Failed to fetch gemini api', response.status)
 
-    const data = await response.json()
-    const review = data.candidates[0].content.parts[0].text 
+        const data = await response.json()
+        const review = data.candidates[0].content.parts[0].text 
 
-    return { ok: response.ok , status: response.status, content: review }
+        return successResponse(review, response.status)
+
+    } catch (error) {
+        console.log('Network error:', error)
+        return errorResponse('Network error', 0)
+    }
 }
 
-// --- Fetch Diff URL ---
-async function fetchDiff(diff: string) {
+// Post AI Review
+async function postReview(review: string | null, payload: any, installationId: number) {
 
-    const response = await fetch(diff, {
-        method: 'GET',
-        headers: {
-            'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`,
-            'Accept': 'application/vnd.github.v3.diff'
-        }
-    })
-
-    if (response.status == 401) return { ok: response.ok, status: response.status, content: 'Unauthorized' }
-    if (!response.ok) return { ok: response.ok, status: response.status, content: null }
-
-    const data = await response.text()
-
-    return { ok: response.ok, status: response.status, content: data }
-}
-
-async function checkDiff(diffUrl: string) {
-
-    const diffResult = await fetchDiff(diffUrl)
-
-    if (!diffResult.ok) return {  message: 'Failed to fetch diff', ok: diffResult.ok, status: 500, content: null }
-    if (!diffResult.content) return {  message: 'Empty diff', ok: false, status: 500, content: null }
-    
-    return { message: 'Success', ok: diffResult.ok, status: diffResult.status, content: diffResult.content }
-}
-
-async function postReview(review: string, payload: any) {
-
-    const installationToken = await getInstallationToken()
+    const installationToken = await getInstallationToken(installationId)
 
     const owner     = payload.repository.owner.login  
     const repo      = payload.repository.name         
@@ -171,10 +186,32 @@ async function postReview(review: string, payload: any) {
 
     console.log('GitHub API response status:', response.status)
 
-    if (!response.ok) return { message: 'Failed to post review', ok: false, status: response.status, data: data }
+    if (!response.ok) return errorResponse('Failed to post review', response.status)
     
-    return { ok: true, status: response.status, data }
+    return successResponse(data, response.status)
 }
+
+async function getInstallationToken(installationId: number) {
+
+    // create JWT
+    const jwtToken = createJWT()
+
+    // exchange for installation token
+    const response = await fetch(
+        `https://api.github.com/app/installations/${installationId}/access_tokens`,
+        {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${jwtToken}`,
+                'Accept': 'application/vnd.github+json'
+            }
+        }
+    )
+
+    const data = await response.json()
+    return data.token  // installation token — valid for 1 hour
+}
+
 
 function createJWT() {
 
@@ -191,24 +228,4 @@ function createJWT() {
         privateKey,
         { algorithm: 'RS256' }
     )
-}
-
-async function getInstallationToken() {
-
-  // create JWT
-    const jwtToken = createJWT()
-    // exchange for installation token
-    const response = await fetch(
-        `https://api.github.com/app/installations/${process.env.GITHUB_INSTALLATION_ID}/access_tokens`,
-        {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${jwtToken}`,
-                'Accept': 'application/vnd.github+json'
-            }
-        }
-    )
-
-    const data = await response.json()
-    return data.token  // installation token — valid for 1 hour
 }
