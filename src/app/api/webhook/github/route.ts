@@ -1,6 +1,8 @@
 import { createHmac } from 'crypto'
 import jwt from 'jsonwebtoken'
 import { successResponse, errorResponse } from '@/utils/response'
+import { Ratelimit } from "@upstash/ratelimit"
+import { Redis } from "@upstash/redis"
 
 export async function POST(req: Request) {
 
@@ -13,8 +15,12 @@ export async function POST(req: Request) {
     if (error) return error
     console.log("Validate Request - SUCCESS")
 
-    // Validate Actions
+    // Check Rate Limiter
     const payload = JSON.parse(rawBody);
+    const rateLimiterError = await checkRateLimiter(payload)
+    if (rateLimiterError) return rateLimiterError
+
+    // Validate Actions
     const action = payload.action;
     const isDraft = payload.pull_request.draft
     const REVIEWABLE_ACTIONS = ['opened', 'synchronize', 'reopened', 'ready_for_review']
@@ -53,6 +59,22 @@ function checkRequest(event: string | null, signature: string | null, rawBody: s
     if (!signature) return  new Response('Missing Signature', { status: 401 })
     if (signature != mySignature) return  new Response('Unauthorized', { status: 401 })
     if (event != 'pull_request') return new Response('Event Ignored', { status: 200 });   
+}
+
+// --- Rate Limiter ---
+async function checkRateLimiter(payload: any) {
+    const ratelimit = new Ratelimit({
+        redis: Redis.fromEnv(),
+        limiter: Ratelimit.slidingWindow(5, "1 h"), // 5 requests per hour
+    })
+
+    const prKey = `${payload.repository.full_name}:${payload.pull_request.number}`
+
+    const { success } = await ratelimit.limit(prKey)
+
+    if (!success) {
+        return new Response('Rate limit exceeded', { status: 429 })
+    }
 }
 
 async function checkDiff(diffUrl: string) {
