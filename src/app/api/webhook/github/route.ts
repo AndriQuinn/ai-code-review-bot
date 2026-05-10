@@ -1,4 +1,3 @@
-import { createHmac } from 'crypto'
 import jwt from 'jsonwebtoken'
 import { successResponse, errorResponse } from '@/utils/response'
 import { Ratelimit } from "@upstash/ratelimit"
@@ -20,6 +19,9 @@ export async function POST(req: Request) {
     const rateLimiterError = await checkRateLimiter(payload)
     if (rateLimiterError) return rateLimiterError
 
+    // Get Installion Token
+    const installationToken = await getInstallationToken(payload.installation.id)
+
     // Validate Actions
     const action = payload.action;
     const isDraft = payload.pull_request.draft
@@ -30,7 +32,7 @@ export async function POST(req: Request) {
     console.log(`Action ${action} - SUCCESS`)
 
     // Check Diff 
-    const getDiff = await checkDiff(payload.pull_request.diff_url)
+    const getDiff = await checkDiff(payload.pull_request.diff_url, installationToken)
     if (!getDiff.ok) return new Response(getDiff.message, { status: 500 })    
     console.log("DIFF Request - SUCCESS")
 
@@ -41,7 +43,7 @@ export async function POST(req: Request) {
     if (!reviewResult.ok) return new Response(reviewResult.message, { status: 500 })
     
     console.log("Review DIFF Request - SUCCESS")
-    postReview(reviewResult.content, payload, payload.installation.id)
+    postReview(reviewResult.content, payload, payload.installation.id, installationToken)
 
     return new Response(JSON.stringify({message: 'OK', pending: "Currently trying to post the review"}), { status: 200  })
 }
@@ -77,9 +79,10 @@ async function checkRateLimiter(payload: any) {
     }
 }
 
-async function checkDiff(diffUrl: string) {
+// --- Check Diff URL ---
+async function checkDiff(diffUrl: string, installationToken: string) {
 
-    const diffResult = await fetchDiff(diffUrl)
+    const diffResult = await fetchDiff(diffUrl, installationToken)
 
     if (!diffResult.ok) return errorResponse(diffResult.message, diffResult.status)
     if (!diffResult.content) return errorResponse('Empty Diff',  500)
@@ -88,13 +91,13 @@ async function checkDiff(diffUrl: string) {
 }
 
 // --- Fetch Diff URL ---
-async function fetchDiff(diff: string) {
+async function fetchDiff(diff: string, installationToken: string) {
 
     try {
         const response = await fetch(diff, {
             method: 'GET',
             headers: {
-                'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`,
+                'Authorization': `Bearer ${installationToken}`,
                 'Accept': 'application/vnd.github.v3.diff'
             }
         })
@@ -150,17 +153,26 @@ async function fetchGeminiApi(model: string, diff: string | null) {
                 body: JSON.stringify({
                     contents: [{
                         parts: [{
-                            text: `
-                            You are a code reviewer. 
-                            Review this pull request diff and give concise, 
-                            actionable feedback. Focus on bugs, security issues, 
-                            and code clarity. Diff: 
-                            
-                            ${diff}
+                            text:`
+                                You are a senior code reviewer. Review this pull request diff.
 
-                            Rules:
-                            - be direct, natural, easy to understand
-                        `
+                                Provide feedback in this format:
+                                ## Summary
+                                One sentence describing what this PR does.
+
+                                ## Issues
+                                List any bugs, security issues, or logic errors. If none, say "No issues found."
+
+                                ## Suggestions  
+                                List improvements for clarity, performance, or best practices.
+
+                                
+                                Rules:
+                                - be direct, natural, and easy to understand
+
+                                Diff:
+                                ${diff}
+                            `
                         }]
                     }]
                 })
@@ -181,9 +193,8 @@ async function fetchGeminiApi(model: string, diff: string | null) {
 }
 
 // Post AI Review
-async function postReview(review: string | null, payload: any, installationId: number) {
+async function postReview(review: string, payload: any, installationId: number, installationToken: string) {
 
-    const installationToken = await getInstallationToken(installationId)
 
     const owner     = payload.repository.owner.login  
     const repo      = payload.repository.name         
@@ -213,7 +224,13 @@ async function postReview(review: string | null, payload: any, installationId: n
     return successResponse(data, response.status)
 }
 
+// --- Get Installation Token ---
 async function getInstallationToken(installationId: number) {
+
+    // Check cache
+    const redis = Redis.fromEnv()
+    const cached = await redis.get(`installation_token:${installationId}`)
+    if (cached) return cached as string // Return cached token if found
 
     // create JWT
     const jwtToken = createJWT()
@@ -231,10 +248,14 @@ async function getInstallationToken(installationId: number) {
     )
 
     const data = await response.json()
-    return data.token  // installation token — valid for 1 hour
+    const token = data.token
+
+    redis.set(`installation_token:${installationId}`, token, { ex: 55 * 60 }) // Cache the installtion token 
+
+    return token  // installation token — valid for 1 hour
 }
 
-
+// Create JWT for the request
 function createJWT() {
 
     const now = Math.floor(Date.now() / 1000)
