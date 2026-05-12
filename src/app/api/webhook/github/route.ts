@@ -1,8 +1,10 @@
-import { createHmac, createCipheriv, createDecipheriv } from 'crypto'
+import { createHmac } from 'crypto'
 import jwt from 'jsonwebtoken'
 import { successResponse, errorResponse } from '@/utils/response'
 import { Ratelimit } from "@upstash/ratelimit"
 import { Redis } from "@upstash/redis"
+import { encrypt } from "@/libs/encrypt"
+import { decrypt } from "@/libs/decrypt"
 
 export async function POST(req: Request) {
 
@@ -13,7 +15,6 @@ export async function POST(req: Request) {
     // Validate Request
     const error = checkRequest(event, signature, rawBody)
     if (error) return error
-    console.log("Validate Request - SUCCESS")
 
     // Check Rate Limiter
     const payload = JSON.parse(rawBody);
@@ -22,6 +23,7 @@ export async function POST(req: Request) {
 
     // Get Installion Token
     const installationToken = await getInstallationToken(payload.installation.id)
+    if (!installationToken) return new Response('Failed to get installation token', { status: 500 })
 
     // Validate Actions
     const action = payload.action;
@@ -30,12 +32,10 @@ export async function POST(req: Request) {
 
     if (isDraft) return new Response('Event Ignored', { status: 200 })
     if (!REVIEWABLE_ACTIONS.includes(action)) return new Response('Event Ignored', { status: 200 })
-    console.log(`Action ${action} - SUCCESS`)
 
     // Check Diff 
     const getDiff = await checkDiff(payload.pull_request.diff_url, installationToken)
     if (!getDiff.ok) return new Response(getDiff.message, { status: 500 })    
-    console.log("DIFF Request - SUCCESS")
 
     // Review Diff 
     const diffText = getDiff.content
@@ -43,7 +43,6 @@ export async function POST(req: Request) {
 
     if (!reviewResult.ok) return new Response(reviewResult.message, { status: 500 })
     
-    console.log("Review DIFF Request - SUCCESS")
     postReview(reviewResult.content, payload, payload.installation.id, installationToken)
 
     return new Response(JSON.stringify({message: 'OK', pending: "Currently trying to post the review"}), { status: 200  })
@@ -66,6 +65,7 @@ function checkRequest(event: string | null, signature: string | null, rawBody: s
 
 // --- Rate Limiter ---
 async function checkRateLimiter(payload: any) {
+    
     const ratelimit = new Ratelimit({
         redis: Redis.fromEnv(),
         limiter: Ratelimit.slidingWindow(5, "1 h"), // 5 requests per hour
@@ -216,11 +216,12 @@ async function postReview(review: string, payload: any, installationId: number, 
         })
     })
 
+    console.log("Github API status: ",response.status)
     const data = await response.json()
 
-    console.log('GitHub API response status:', response.status)
-
     if (!response.ok) return errorResponse('Failed to post review', response.status)
+
+    
     
     return successResponse(data, response.status)
 }
@@ -230,30 +231,36 @@ async function getInstallationToken(installationId: number) {
 
     // Check cache
     const redis = Redis.fromEnv()
-    const cached = await redis.get(`installation_token:${installationId}`)
-    if (cached) return cached as string // Return cached token if found
+    const cacheKey = `installation_token:${installationId}`
+    const cached = await redis.get(cacheKey) 
+    if (cached) return decrypt(cached as string) // Return cached token if found
 
-    // create JWT
-    const jwtToken = createJWT()
+    try {
+        // create JWT
+        const jwtToken = createJWT()
 
-    // exchange for installation token
-    const response = await fetch(
-        `https://api.github.com/app/installations/${installationId}/access_tokens`,
-        {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${jwtToken}`,
-                'Accept': 'application/vnd.github+json'
+        // exchange for installation token
+        const response = await fetch(
+            `https://api.github.com/app/installations/${installationId}/access_tokens`,
+            {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${jwtToken}`,
+                    'Accept': 'application/vnd.github+json'
+                }
             }
-        }
-    )
+        )
 
-    const data = await response.json()
-    const token = data.token
+        const data = await response.json()
+        const token = encrypt(data.token)
 
-    redis.set(`installation_token:${installationId}`, token, { ex: 55 * 60 }) // Cache the installtion token 
+        redis.set(cacheKey, token, { ex: 55 * 60 }) // Cache the installtion token 
 
-    return token  // installation token — valid for 1 hour
+        return token   // installation token — valid for 1 hour
+
+    } catch (error) {
+        return null
+    }
 }
 
 // Create JWT for the request
@@ -266,8 +273,8 @@ function createJWT() {
     return jwt.sign(
         {
             iss: process.env.GITHUB_APP_ID,  // App ID
-            iat: now,                        // issued now
-            exp: now + 600                   // expires in 10 minutes
+            iat: now - 60,                        // issued now
+            exp: now + 540                   // expires in 10 minutes
         },
         privateKey,
         { algorithm: 'RS256' }
